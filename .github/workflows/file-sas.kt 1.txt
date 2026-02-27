@@ -1,0 +1,37 @@
+// MainActivity.kt
+import android.app.Activity
+import android.content.Intent
+import android.os.Bundle
+import android.widget.Button
+import androidx.appcompat.app.AppCompatActivity
+import android.net.VpnService
+
+class MainActivity : AppCompatActivity() {
+    private lateinit var vpnServiceIntent: Intent
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        vpnServiceIntent = Intent(this, CustomVpnService::class.java)
+
+        findViewById<Button>(R.id.btnStartVPN).setOnClickListener {
+            startVPN()
+        }
+    }
+
+    private fun startVPN() {
+        val prepareIntent = VpnService.prepare(this)
+        if (prepareIntent != null) {
+            startActivityForResult(prepareIntent, 0)
+        } else {
+            onActivityResult(0, Activity.RESULT_OK, null)
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (resultCode == Activity.RESULT_OK) {
+            CustomVpnService.start(this, vpnServiceIntent)
+        }
+    }
+}

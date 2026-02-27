@@ -1,0 +1,226 @@
+// CustomVpnService.kt
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.res.AssetManager
+import android.net.VpnService
+import android.os.Build
+import android.os.ParcelFileDescriptor
+import android.util.Log
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import java.io.File
+import java.io.FileOutputStream
+import java.util.concurrent.TimeUnit
+
+class CustomVpnService : VpnService() {
+    companion object {
+        private const val TAG = "CustomVpnService"
+        private var currentServer = ""
+        private var currentPort = 443
+        private var currentUuid = ""
+        private var currentSNI = ""
+        private val okHttpClient = OkHttpClient.Builder()
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(5, TimeUnit.SECONDS)
+            .build()
+        private val CHANNEL_ID = "VPN_CHANNEL"
+        private val NOTIFICATION_ID = 1
+
+        fun start(context: Context, intent: Intent) {
+            context.startService(intent)
+        }
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+        startForeground(NOTIFICATION_ID, createNotification())
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Carregar dados do servidor
+        loadServerData()
+        
+        // Preparar ambiente Xray
+        prepareXrayRuntime()
+        
+        // Iniciar tunelamento
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                // Escaneamento de SNI
+                currentSNI = findOptimalSNI()
+                if (currentSNI.isNotEmpty()) {
+                    Log.d(TAG, "Found optimal SNI: $currentSNI")
+                    
+                    // Criar túnel
+                    val config = generateConfig(currentSNI)
+                    val pfd = createTunnel(config)
+                    if (pfd != null) {
+                        Log.d(TAG, "Tunnel created successfully")
+                        
+                        // Iniciar tunelamento
+                        runTunnel(pfd.fd, config)
+                    } else {
+                        Log.e(TAG, "Failed to create tunnel")
+                    }
+                } else {
+                    Log.e(TAG, "Failed to find optimal SNI")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Error during tunneling", e)
+            }
+        }
+
+        return START_STICKY
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "VPN Service Channel",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "VPN Service Notifications"
+            }
+            val notificationManager = getSystemService(NotificationManager::class.java)
+            notificationManager.createNotificationChannel(channel)
+        }
+    }
+
+    private fun createNotification(): Notification {
+        return Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle("VPN Service")
+            .setContentText("Running securely...")
+            .setSmallIcon(R.drawable.ic_vpn)
+            .build()
+    }
+
+    private fun loadServerData() {
+        try {
+            // Primeiro tenta obter dados do Intent
+            currentServer = intent?.getStringExtra("SERVER_IP") ?: ""
+            currentPort = intent?.getIntExtra("SERVER_PORT", 443) ?: 443
+            currentUuid = intent?.getStringExtra("UUID") ?: ""
+            
+            // Se não obtiver dados, tenta buscar de JSON externo
+            if (currentServer.isEmpty() || currentUuid.isEmpty()) {
+                val jsonUrl = "https://example.com/server-config.json"
+                val response = okHttpClient.newCall(Request.Builder().url(jsonUrl).build()).execute()
+                val responseBody = response.body?.string()
+                
+                // Parse JSON e extrair dados
+                // ...
+                
+                Log.d(TAG, "Loaded server data from external source")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to load server data", e)
+        }
+    }
+
+    private fun prepareXrayRuntime() {
+        try {
+            Log.d(TAG, "Preparing Xray runtime")
+            
+            // Copiar binário Xray da pasta assets
+            val xrayFile = File(filesDir, "xray")
+            val assetManager: AssetManager = assets
+            val inputStream = assetManager.open("xray")
+            FileOutputStream(xrayFile).use { output ->
+                inputStream.copyTo(output)
+            }
+            
+            // Aplicar permissão de execução
+            xrayFile.setExecutable(true)
+            Log.d(TAG, "Xray runtime prepared successfully")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to prepare Xray runtime", e)
+        }
+    }
+
+    private suspend fun findOptimalSNI(): String {
+        Log.d(TAG, "Scanning for optimal SNI")
+        
+        val domains = listOf("unitelmoney.ao", "internet.unitel.ao", "m.unitel.ao", "api.unitel.ao")
+        for (domain in domains) {
+            if (testDomain(domain)) {
+                return domain
+            }
+        }
+        return ""
+    }
+
+    private suspend fun testDomain(domain: String): Boolean {
+        return withContext(Dispatchers.IO) {
+            try {
+                val request = Request.Builder()
+                    .url("https://$domain/")
+                    .build()
+                
+                val response = okHttpClient.newCall(request).execute()
+                response.isSuccessful
+            } catch (e: Exception) {
+                false
+            }
+        }
+    }
+
+    private fun generateConfig(sni: String): String {
+        return """
+            {
+              "inbounds": [{
+                "port": 1080,
+                "protocol": "socks",
+                "settings": {
+                  "auth": "noauth"
+                }
+              }],
+              "outbounds": [{
+                "protocol": "vmess",
+                "settings": {
+                  "vnext": [{
+                    "address": "$currentServer",
+                    "port": $currentPort,
+                    "users": [{"id": "$currentUuid"}]
+                  }]
+                },
+                "streamSettings": {
+                  "network": "ws",
+                  "wsSettings": {
+                    "path": "/v2ray/websocket",
+                    "headers": {"Host": "$sni"}
+                  }
+                }
+              }]
+            }
+        """.trimIndent()
+    }
+
+    private fun createTunnel(config: String): ParcelFileDescriptor? {
+        Log.d(TAG, "Creating tunnel")
+        
+        val builder = Builder()
+        builder.addAddress("10.0.0.2", 32)
+        builder.addRoute("0.0.0.0", 0)
+        builder.setSession("SecureTunnel")
+        builder.setMtu(1500)
+        return builder.establish()
+    }
+
+    private fun runTunnel(fd: Int, config: String) {
+        Log.d(TAG, "Starting tunnel process")
+        
+        try {
+            // Executar Xray-core
+            val process = Runtime.getRuntime().exec(arrayOf("/data/data/com.example.app/files/xray", "-c", config))
+            Log.d(TAG, "Tunnel started successfully")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start tunnel", e)
+        }
+    }
+}
